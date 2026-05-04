@@ -1,10 +1,202 @@
-// ============================================================
-// SVM Task Management System — Google Apps Script Backend
-// ============================================================
+const SHEET_NAME   = "Tasks";
+const REPORT_SHEET = "Weekly Reports";
 
-const SHEET_NAME = "Tasks";
 
-// ── Entry point for GET requests (serves the web app HTML) ──
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("SVM Admin")
+    .addItem("Generate AI Weekly Report", "generateWeeklyReport")
+    .addItem("Setup Sheet (first time only)", "setupSheet")
+    .addToUi();
+}
+
+function generateWeeklyReport() {
+  const ss        = SpreadsheetApp.getActiveSpreadsheet();
+  const taskSheet = ss.getSheetByName(SHEET_NAME);
+
+  if (!taskSheet) {
+    SpreadsheetApp.getUi().alert("Tasks sheet not found. Please run Setup Sheet first.");
+    return;
+  }
+
+  let reportSheet = ss.getSheetByName(REPORT_SHEET);
+  if (!reportSheet) {
+    reportSheet = ss.insertSheet(REPORT_SHEET);
+  } else {
+    reportSheet.clearContents();
+  }
+
+  reportSheet.getRange(1, 1, 1, 4).setValues([
+    ["Member Name", "Tasks Done", "Tasks Missed/Late", "AI Performance Summary"]
+  ]);
+  reportSheet.getRange(1, 1, 1, 4)
+    .setBackground("#0f1628")
+    .setFontColor("#4f9cf9")
+    .setFontWeight("bold");
+  reportSheet.setColumnWidth(1, 180);
+  reportSheet.setColumnWidth(2, 100);
+  reportSheet.setColumnWidth(3, 140);
+  reportSheet.setColumnWidth(4, 500);
+  reportSheet.setFrozenRows(1);
+
+  const data    = taskSheet.getDataRange().getValues();
+  const headers = data[0];
+
+  const col = (name) => headers.indexOf(name);
+  const nameIdx   = col("Assigned To");
+  const taskIdx   = col("Task Name");
+  const typeIdx   = col("Task Type");
+  const planIdx   = col("Planned Date");
+  const doneIdx   = col("Actual Completion Date");
+  const statusIdx = col("Status");
+  const scoreIdx  = col("Weekly Score");
+
+  const memberMap = {};
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[nameIdx]) continue;
+    const member = row[nameIdx].toString().trim();
+    if (!memberMap[member]) {
+      memberMap[member] = { done: [], late: [], pending: [] };
+    }
+    const status = row[statusIdx] ? row[statusIdx].toString().trim() : "";
+    const score  = Number(row[scoreIdx]);
+    const task   = row[taskIdx] ? row[taskIdx].toString().trim() : "Unnamed Task";
+    const type   = row[typeIdx] ? row[typeIdx].toString().trim() : "";
+
+    if (status === "Done" && score >= 0) {
+      memberMap[member].done.push(task + " (" + type + ")");
+    } else if (status === "Done" && score < 0) {
+      memberMap[member].late.push(task + " (" + type + ")");
+    } else {
+      memberMap[member].pending.push(task + " (" + type + ")");
+    }
+  }
+
+  const members = Object.keys(memberMap).sort();
+  if (members.length === 0) {
+    SpreadsheetApp.getUi().alert("No task data found. Add tasks to the Tasks sheet first.");
+    return;
+  }
+
+  const reportRows = [];
+  const weekLabel  = getWeekLabel();
+
+  members.forEach(function(member) {
+    const stats    = memberMap[member];
+    const doneCount   = stats.done.length;
+    const lateCount   = stats.late.length;
+    const pendingCount = stats.pending.length;
+    const totalDone   = doneCount + lateCount;
+    const totalTasks  = totalDone + pendingCount;
+
+    const doneList    = stats.done.length    > 0 ? stats.done.join(", ")    : "None";
+    const lateList    = stats.late.length    > 0 ? stats.late.join(", ")    : "None";
+    const pendingList = stats.pending.length > 0 ? stats.pending.join(", ") : "None";
+
+    const prompt =
+      "You are a school principal at Saraswati Vidyamandir writing a weekly staff performance review.\n\n" +
+      "Staff Member: " + member + "\n" +
+      "Week: " + weekLabel + "\n" +
+      "Tasks completed on time: " + doneList + "\n" +
+      "Tasks completed late: " + lateList + "\n" +
+      "Tasks not completed: " + pendingList + "\n\n" +
+      "Write a professional 2-3 sentence performance summary for this staff member. " +
+      "Be specific — mention actual task names. " +
+      "Acknowledge good work if tasks were done on time. " +
+      "Flag concerns if tasks were late or missed. " +
+      "End with one actionable suggestion for next week. " +
+      "Do not use bullet points. Do not use greetings or salutations.";
+
+    let summary = "";
+    try {
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 150
+        }
+      };
+      const options = {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      };
+      const response = UrlFetchApp.fetch(GEMINI_URL, options);
+      const json     = JSON.parse(response.getContentText());
+      const text     = json.candidates &&
+                       json.candidates[0] &&
+                       json.candidates[0].content &&
+                       json.candidates[0].content.parts &&
+                       json.candidates[0].content.parts[0].text;
+      summary = text ? text.trim() : fallbackSummary(member, doneCount, lateCount, pendingCount);
+    } catch (e) {
+      summary = fallbackSummary(member, doneCount, lateCount, pendingCount);
+    }
+
+    reportRows.push([member, doneCount, lateCount + pendingCount, summary]);
+
+    Utilities.sleep(500);
+  });
+
+  if (reportRows.length > 0) {
+    const dataRange = reportSheet.getRange(2, 1, reportRows.length, 4);
+    dataRange.setValues(reportRows);
+    dataRange.setWrap(true);
+    dataRange.setVerticalAlignment("top");
+
+    reportRows.forEach(function(row, i) {
+      const sheetRow  = i + 2;
+      const done      = Number(row[1]);
+      const missed    = Number(row[2]);
+      let bgColor     = "#1a2f1a";
+      if (missed > 0 && missed >= done) bgColor = "#2f1a1a";
+      else if (missed > 0)              bgColor = "#2f2a1a";
+      reportSheet.getRange(sheetRow, 1, 1, 4).setBackground(bgColor).setFontColor("#e8edf5");
+    });
+
+    reportSheet.insertRowBefore(1);
+    reportSheet.getRange(1, 1, 1, 4)
+      .merge()
+      .setValue("SVM Weekly Performance Report — " + weekLabel + "   |   Generated by Gemini AI   |   " + new Date().toLocaleString("en-IN"))
+      .setBackground("#0a0f1e")
+      .setFontColor("#4f9cf9")
+      .setFontWeight("bold")
+      .setFontSize(11);
+  }
+
+  ss.setActiveSheet(reportSheet);
+  SpreadsheetApp.getUi().alert(
+    "Weekly Report Generated!\n\n" +
+    members.length + " staff members analysed by Gemini AI.\n" +
+    "Check the \"Weekly Reports\" tab."
+  );
+}
+
+function fallbackSummary(member, done, late, pending) {
+  if (late === 0 && pending === 0) {
+    return member + " completed all assigned tasks on time this week. Excellent performance — maintain this consistency next week.";
+  }
+  if (pending > 0) {
+    return member + " has " + pending + " incomplete task(s) this week. " +
+           (late > 0 ? late + " task(s) were submitted late. " : "") +
+           "Prioritise pending tasks at the start of each day next week.";
+  }
+  return member + " completed tasks but " + late + " submission(s) were late this week. Aim to submit all tasks before their planned date next week.";
+}
+
+function getWeekLabel() {
+  const now     = new Date();
+  const dow     = now.getDay();
+  const diffMon = (dow === 0) ? -6 : 1 - dow;
+  const mon     = new Date(now); mon.setDate(now.getDate() + diffMon);
+  const sun     = new Date(mon); sun.setDate(mon.getDate() + 6);
+  const fmt     = { day: "numeric", month: "short" };
+  return mon.toLocaleDateString("en-IN", fmt) + " – " +
+         sun.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+}
+
 function doGet(e) {
   const template = HtmlService.createTemplateFromFile("Index");
   return template
@@ -14,7 +206,6 @@ function doGet(e) {
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-// ── Return tasks for a specific team member and today ──
 function getTasksForMember(memberName) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
@@ -23,13 +214,13 @@ function getTasksForMember(memberName) {
 
   const now = new Date();
   const todayStr = formatDate(now);
-  const todayDow = now.getDay(); // 0=Sun, 1=Mon ... 6=Sat
+  const todayDow = now.getDay();
 
   const result = { recurring: [], onetime: [] };
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    if (!row[0]) continue; // skip empty rows
+    if (!row[0]) continue;
 
     const rowObj = {};
     headers.forEach((h, idx) => { rowObj[h] = row[idx]; });
@@ -42,11 +233,6 @@ function getTasksForMember(memberName) {
 
     if (status !== "Pending") continue;
 
-    // ── FIX: Proper recurrence logic ────────────────────────
-    // DAILY   → show every day (no date restriction)
-    // WEEKLY  → show only on the same weekday as Planned Date
-    // ONE-TIME→ show only on the exact Planned Date
-    // ────────────────────────────────────────────────────────
     const plannedRaw  = rowObj["Planned Date"];
     const plannedDate = plannedRaw ? new Date(plannedRaw) : null;
     const plannedStr  = plannedDate ? formatDate(plannedDate) : "";
@@ -81,7 +267,6 @@ function getTasksForMember(memberName) {
   return result;
 }
 
-// ── Mark a task as Done and write score to sheet ──
 function markTaskDone(rowIndex) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
@@ -101,14 +286,12 @@ function markTaskDone(rowIndex) {
   sheet.getRange(rowIndex, statusCol).setValue("Done");
   sheet.getRange(rowIndex, completionCol).setValue(formatDate(new Date()));
 
-  // ── FIX: Score — +1 on time, -1 late ──
   const score = (today <= planned) ? 1 : -1;
   sheet.getRange(rowIndex, scoreCol).setValue(score);
 
   return { success: true, score: score };
 }
 
-// ── Weekly score sum for a member ──
 function getWeeklyScore(memberName) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
@@ -131,7 +314,6 @@ function getWeeklyScore(memberName) {
   return total;
 }
 
-// ── Get all team members for the selector dropdown ──
 function getTeamMembers() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
@@ -146,62 +328,103 @@ function getTeamMembers() {
   return [...members].sort();
 }
 
-// ── FIX: Rule-based AI Priority Engine ──────────────────────
-// Replaces the broken LanguageApp.model() call.
-// Analyses the task list and returns a context-aware insight.
-// No external API — works 100% reliably.
-// ────────────────────────────────────────────────────────────
+const GEMINI_API_KEY = "AIzaSyDVmcWo9fVQbdgvqRcrme24FXZg1wL_1lE";
+const GEMINI_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
+  GEMINI_API_KEY;
+
 function getAISuggestion(tasks) {
   if (!tasks || tasks.length === 0) {
     return "No pending tasks found. You are all clear for today — great work!";
   }
 
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-  const overdue = tasks.filter(t => {
-    if (!t.plannedDate) return false;
-    const d = new Date(t.plannedDate); d.setHours(0, 0, 0, 0);
-    return d < today;
-  });
+    const taskLines = tasks.map(function(t) {
+      const isOverdue = t.plannedDate && (new Date(t.plannedDate) < today);
+      return "- " + t.name + " [" + t.type + "]" + (isOverdue ? " (OVERDUE)" : "");
+    }).join("\n");
 
-  const onetimeUrgent = tasks.filter(t => t.type === "One-time");
-  const dailyTasks    = tasks.filter(t => t.type === "Daily");
-  const weeklyTasks   = tasks.filter(t => t.type === "Weekly");
-  const totalPending  = tasks.length;
+    const prompt =
+      "You are a productivity assistant for Saraswati Vidyamandir, a school in Ambala. " +
+      "A staff member has the following pending tasks for today:\n\n" +
+      taskLines + "\n\n" +
+      "Write a concise, professional daily briefing in exactly 2-3 sentences. " +
+      "Tell them which task to prioritise first and why. " +
+      "If any task is marked OVERDUE, flag it urgently. " +
+      "Be specific — mention the actual task name. " +
+      "Do not use bullet points. Do not use greetings. Start directly with the insight.";
 
-  // Priority rules — most critical first
-  if (overdue.length > 0) {
-    const names = overdue.map(t => '"' + t.name + '"').join(", ");
-    return "AI Insight: " + overdue.length + " overdue task" + (overdue.length > 1 ? "s" : "") +
-           " detected — " + names + ". Complete " + (overdue.length > 1 ? "these" : "this") +
-           " immediately to recover score points before the day ends.";
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.4,
+        maxOutputTokens: 120
+      }
+    };
+
+    const options = {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(GEMINI_URL, options);
+    const json = JSON.parse(response.getContentText());
+
+    const text = json.candidates &&
+                 json.candidates[0] &&
+                 json.candidates[0].content &&
+                 json.candidates[0].content.parts &&
+                 json.candidates[0].content.parts[0].text;
+
+    if (text && text.trim().length > 0) {
+      return text.trim();
+    }
+
+    throw new Error("Empty Gemini response");
+
+  } catch (e) {
+    const today2 = new Date(); today2.setHours(0, 0, 0, 0);
+
+    const overdue = tasks.filter(function(t) {
+      if (!t.plannedDate) return false;
+      const d = new Date(t.plannedDate); d.setHours(0, 0, 0, 0);
+      return d < today2;
+    });
+
+    const onetimeUrgent = tasks.filter(function(t) { return t.type === "One-time"; });
+    const dailyTasks    = tasks.filter(function(t) { return t.type === "Daily"; });
+    const weeklyTasks   = tasks.filter(function(t) { return t.type === "Weekly"; });
+    const totalPending  = tasks.length;
+
+    if (overdue.length > 0) {
+      const names = overdue.map(function(t) { return '"' + t.name + '"'; }).join(", ");
+      return "AI Insight: " + overdue.length + " overdue task" + (overdue.length > 1 ? "s" : "") +
+             " detected — " + names + ". Complete " + (overdue.length > 1 ? "these" : "this") +
+             " immediately to recover score points before the day ends.";
+    }
+    if (onetimeUrgent.length > 0) {
+      return 'AI Insight: Start with "' + onetimeUrgent[0].name + '" — it is a one-time task with a fixed deadline today. ' +
+             "Completing it first secures your score. Recurring tasks can follow.";
+    }
+    if (totalPending >= 5) {
+      return "AI Insight: " + totalPending + " tasks pending today — a heavy load. Tackle Daily tasks first to lock in base points, then move to Weekly.";
+    }
+    if (weeklyTasks.length > 0 && dailyTasks.length === 0) {
+      return 'AI Insight: Your weekly task "' + weeklyTasks[0].name + '" is due today. Complete it before end of day to keep your score positive.';
+    }
+    if (dailyTasks.length > 0) {
+      return "AI Insight: " + dailyTasks.length + " daily routine task" + (dailyTasks.length > 1 ? "s" : "") +
+             " pending. Consistent completions build a strong weekly score.";
+    }
+    return "AI Insight: " + totalPending + " task" + (totalPending > 1 ? "s" : "") + " remaining. You are on track — keep the streak going.";
   }
-
-  if (onetimeUrgent.length > 0) {
-    return 'AI Insight: Start with "' + onetimeUrgent[0].name + '" — it is a one-time task with a fixed deadline today. ' +
-           "Completing it first secures your score. Recurring tasks can follow.";
-  }
-
-  if (totalPending >= 5) {
-    return "AI Insight: " + totalPending + " tasks pending today — a heavy load. Tackle Daily tasks first to lock in base " +
-           "points, then move to Weekly. Prioritise completion over perfection.";
-  }
-
-  if (weeklyTasks.length > 0 && dailyTasks.length === 0) {
-    return 'AI Insight: Your weekly task "' + weeklyTasks[0].name + '" is due today. ' +
-           "Completing it keeps your weekly score positive — do not leave it for end of day.";
-  }
-
-  if (dailyTasks.length > 0) {
-    return "AI Insight: " + dailyTasks.length + " daily routine task" + (dailyTasks.length > 1 ? "s" : "") +
-           " pending. Consistent daily completions compound into a strong weekly score.";
-  }
-
-  return "AI Insight: " + totalPending + " task" + (totalPending > 1 ? "s" : "") +
-         " remaining today. You are on track — keep the streak going.";
 }
 
-// ── Utility: format Date as YYYY-MM-DD ──
 function formatDate(d) {
   const yr = d.getFullYear();
   const mo = String(d.getMonth() + 1).padStart(2, "0");
@@ -209,14 +432,11 @@ function formatDate(d) {
   return yr + "-" + mo + "-" + dy;
 }
 
-// ── One-time setup: creates columns + sample data ──
-// Run this ONCE from the Apps Script editor before deploying.
 function setupSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(SHEET_NAME);
 
-  // ── FIX: Task ID added as first column ──
   const headers = [
     "Task ID",
     "Task Name",
@@ -236,14 +456,12 @@ function setupSheet() {
     .setFontColor("#4f9cf9")
     .setFontWeight("bold");
 
-  // Data validation: Task Type (column 3)
   sheet.getRange(2, 3, 200, 1).setDataValidation(
     SpreadsheetApp.newDataValidation()
       .requireValueInList(["Daily", "Weekly", "One-time"])
       .setAllowInvalid(false).build()
   );
 
-  // Data validation: Status (column 7)
   sheet.getRange(2, 7, 200, 1).setDataValidation(
     SpreadsheetApp.newDataValidation()
       .requireValueInList(["Pending", "Done"])
@@ -262,12 +480,42 @@ function setupSheet() {
 
   const today = formatDate(new Date());
   const sampleData = [
-    ["T001", "Morning Assembly Preparation", "Daily",    "Rajesh Kumar", today, "", "Pending", ""],
-    ["T002", "Update Student Attendance",    "Daily",    "Priya Sharma", today, "", "Pending", ""],
-    ["T003", "Grade Weekly Tests",           "Weekly",   "Rajesh Kumar", today, "", "Pending", ""],
-    ["T004", "Parent Meeting Notes",         "One-time", "Priya Sharma", today, "", "Pending", ""],
-    ["T005", "Library Inventory Check",      "One-time", "Anil Verma",   today, "", "Pending", ""],
-    ["T006", "Check Fee Records",            "Daily",    "Anil Verma",   today, "", "Pending", ""]
+    ["T001", "Morning Assembly Coordination",   "Daily",    "Arjun",       today, "", "Pending", ""],
+    ["T002", "Update Student Attendance",        "Daily",    "Arjun",       today, "", "Pending", ""],
+    ["T003", "Grade Weekly Science Tests",       "Weekly",   "Arjun",       today, "", "Pending", ""],
+
+    ["T004", "Check Library Book Returns",       "Daily",    "Divya", today, "", "Pending", ""],
+    ["T005", "Parent Meeting Preparation",       "One-time", "Divya", today, "", "Pending", ""],
+
+    ["T006", "Fee Collection Reconciliation",   "Weekly",   "Suresh", today, "", "Pending", ""],
+    ["T007", "Update Staff Duty Roster",         "One-time", "Suresh", today, "", "Pending", ""],
+
+    ["T008", "Prepare Mid-Term Report Cards",   "One-time", "Lakshmi", today, "", "Pending", ""],
+    ["T009", "Monitor Classroom Cleanliness",   "Daily",    "Lakshmi", today, "", "Pending", ""],
+
+    ["T010", "Computer Lab Maintenance Check",  "Weekly",   "Karthik", today, "", "Pending", ""],
+    ["T011", "Update Student Portal Records",   "Daily",    "Karthik", today, "", "Pending", ""],
+
+    ["T012", "Coordinate Sports Day Practice",  "Daily",    "Meenakshi", today, "", "Pending", ""],
+    ["T013", "Submit Annual Budget Proposal",   "One-time", "Meenakshi", today, "", "Pending", ""],
+
+    ["T014", "Security Round Morning Shift",    "Daily",    "Venkat",    today, "", "Pending", ""],
+    ["T015", "Maintenance Log Update",          "Weekly",   "Venkat",    today, "", "Pending", ""],
+
+    ["T016", "Prepare Weekly Newsletter",       "Weekly",   "Priya", today, "", "Pending", ""],
+    ["T017", "Staff Meeting Minutes",           "One-time", "Priya", today, "", "Pending", ""],
+
+    ["T018", "Grade English Assignments",       "Daily",    "Rajesh",       today, "", "Pending", ""],
+    ["T019", "Conduct Remedial Class",          "Weekly",   "Rajesh",       today, "", "Pending", ""],
+
+    ["T020", "Prepare Lesson Plan",             "Daily",    "Anitha", today, "", "Pending", ""],
+    ["T021", "Submit Teaching Aid Request",     "One-time", "Anitha", today, "", "Pending", ""],
+
+    ["T022", "Update Inventory Register",       "Weekly",   "Srinivas",   today, "", "Pending", ""],
+    ["T023", "Check Laboratory Equipment",      "Daily",    "Srinivas",   today, "", "Pending", ""],
+
+    ["T024", "Counsel Students on Attendance",  "Weekly",   "Padmavathi", today, "", "Pending", ""],
+    ["T025", "Coordinate Annual Day Planning",  "One-time", "Padmavathi", today, "", "Pending", ""]
   ];
 
   sheet.getRange(2, 1, sampleData.length, headers.length).setValues(sampleData);
