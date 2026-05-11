@@ -72,11 +72,6 @@ A lightweight, mobile-first task management system backed by Google Sheets, with
 
 ---
 
-### 📊 Scoring & Reports
-![Weekly Score](Screenshots/weekly_score.jpg)
-
----
-
 ## 💻 Sample AI Summary Response
 
 ```json
