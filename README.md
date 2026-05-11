@@ -28,26 +28,6 @@ A lightweight, mobile-first task management system backed by Google Sheets, with
 
 ---
 
-## 📁 Project Folder Structure
-📦 svm-task-management-system/
-├── Frontend/
-│   ├── index.html
-│   ├── style.css
-│   └── app.js
-├── Apps_Script/
-│   ├── Code.gs
-│   └── appsscript.json
-├── AI_Module/
-│   └── summary_prompt.js
-├── Screenshots/
-│   ├── task_view.jpg
-│   ├── mark_done.jpg
-│   └── weekly_score.jpg
-├── .gitignore
-└── README.md
-
----
-
 ## ⚙️ Workflow
 
 1. Admin enters tasks in **Google Sheet** — name, type, assignee, planned date, status.
